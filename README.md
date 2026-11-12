@@ -50,7 +50,8 @@ alembic upgrade head
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgresql+asyncpg://openkey:openkey@db:5432/openkey` | Async SQLAlchemy URL |
 | `JWT_SECRET` | *(required)* | Signing secret — **min 32 chars**; placeholders rejected at startup |
-| `JWT_ALGORITHM` | `HS256` | JWT algorithm |\n| `AUTH_HASH_PEPPER` | derived from `JWT_SECRET` when omitted | Stable server-only secret (recommended: `openssl rand -hex 32`) used to HMAC auth verifiers; back it up and do not rotate casually |
+| `JWT_ALGORITHM` | `HS256` | JWT algorithm |
+| `AUTH_HASH_PEPPER` | derived from `JWT_SECRET` when omitted | Stable server-only secret (recommended: `openssl rand -hex 32`) used to HMAC auth verifiers; back it up and do not rotate casually |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | Access JWT TTL |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Opaque refresh token TTL (rotated on use) |
 | `CORS_ORIGINS` | localhost:3000/8080 | Comma-separated origins — **no `*`** |
