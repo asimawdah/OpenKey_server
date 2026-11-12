@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://openkey:openkey@localhost:5432/openkey"
     jwt_secret: str = Field(min_length=32)
     jwt_algorithm: str = "HS256"
+    # Stable server-side pepper for one-way auth_hash verifiers. If omitted,
+    # derive a domain-separated key from JWT_SECRET for backwards-compatible rollout.
+    auth_hash_pepper: str | None = None
     # Short-lived access JWT; clients renew via refresh tokens.
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
@@ -55,6 +58,18 @@ class Settings(BaseSettings):
         if len(secret) < 32:
             raise ValueError("JWT_SECRET must be at least 32 characters")
         return secret
+
+    @field_validator("auth_hash_pepper")
+    @classmethod
+    def validate_auth_hash_pepper(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        pepper = value.strip()
+        if len(pepper) < 32:
+            raise ValueError("AUTH_HASH_PEPPER must be at least 32 characters")
+        if pepper.lower() in _INSECURE_JWT_SECRETS:
+            raise ValueError("AUTH_HASH_PEPPER must not use a known insecure placeholder")
+        return pepper
 
     @field_validator("cors_origins")
     @classmethod

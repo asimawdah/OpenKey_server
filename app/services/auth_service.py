@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import secrets
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -28,9 +29,45 @@ def _normalize_auth_hash(value: str) -> str:
     return value.strip().rstrip("=")
 
 
-def verify_auth_hash(stored: str, provided: str) -> bool:
-    """Constant-time comparison of client-derived auth hashes."""
+_AUTH_HASH_VERIFIER_PREFIX = "hmac-sha256-v1:"
+
+
+def _auth_hash_pepper(settings: Settings) -> bytes:
+    """Return a stable, domain-separated server secret for auth verifiers."""
+    if settings.auth_hash_pepper:
+        return settings.auth_hash_pepper.encode("utf-8")
+    # Backwards-compatible fallback. Configure AUTH_HASH_PEPPER explicitly
+    # before deploying to production to decouple verifier validity from JWT rotation.
+    return hmac.new(
+        settings.jwt_secret.encode("utf-8"),
+        b"OpenKey/auth-hash-pepper/v1",
+        hashlib.sha256,
+    ).digest()
+
+
+def hash_auth_hash(value: str, settings: Settings | None = None) -> str:
+    """Store a keyed one-way verifier, never the reusable client auth_hash."""
+    cfg = settings or get_settings()
+    normalized = _normalize_auth_hash(value)
+    digest = hmac.new(
+        _auth_hash_pepper(cfg),
+        normalized.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{_AUTH_HASH_VERIFIER_PREFIX}{digest}"
+
+
+def verify_auth_hash(
+    stored: str,
+    provided: str,
+    settings: Settings | None = None,
+) -> bool:
+    """Verify modern HMAC verifiers and legacy plaintext rows during migration."""
     try:
+        if stored.startswith(_AUTH_HASH_VERIFIER_PREFIX):
+            expected = hash_auth_hash(provided, settings)
+            return secrets.compare_digest(stored, expected)
+        # Legacy compatibility only. Successful login upgrades the row.
         return secrets.compare_digest(
             _normalize_auth_hash(stored).encode("utf-8"),
             _normalize_auth_hash(provided).encode("utf-8"),
@@ -108,7 +145,7 @@ class AuthService:
 
         user = User(
             email=data.email.lower(),
-            auth_hash=data.auth_hash,
+            auth_hash=hash_auth_hash(data.auth_hash, self.settings),
             encrypted_vault_key=data.encrypted_vault_key,
             kdf_params=data.kdf_params,
             salt=data.salt,
@@ -122,8 +159,13 @@ class AuthService:
         user = await self.session.scalar(
             select(User).where(User.email == data.email.lower())
         )
-        if user is None or not verify_auth_hash(user.auth_hash, data.auth_hash):
+        if user is None or not verify_auth_hash(user.auth_hash, data.auth_hash, self.settings):
             raise PermissionError("Invalid email or auth_hash")
+        if not user.auth_hash.startswith(_AUTH_HASH_VERIFIER_PREFIX):
+            # Opportunistically upgrade any legacy row that was not covered by
+            # the one-time data migration (e.g. rolling deployments).
+            user.auth_hash = hash_auth_hash(data.auth_hash, self.settings)
+            await self.session.flush()
         return await self._issue_tokens(user)
 
     async def _revoke_all_refresh_tokens(self, user_id: UUID, now: datetime) -> None:
@@ -189,11 +231,11 @@ class AuthService:
         return await self.session.scalar(select(User).where(User.id == user_id))
 
     async def rekey(self, user: User, data: RekeyRequest) -> User:
-        if not verify_auth_hash(user.auth_hash, data.current_auth_hash):
+        if not verify_auth_hash(user.auth_hash, data.current_auth_hash, self.settings):
             raise PermissionError("Invalid current auth_hash")
 
         now = datetime.now(UTC)
-        user.auth_hash = data.auth_hash
+        user.auth_hash = hash_auth_hash(data.auth_hash, self.settings)
         user.encrypted_vault_key = data.encrypted_vault_key
         if data.salt is not None:
             user.salt = data.salt
@@ -207,7 +249,7 @@ class AuthService:
         return user
 
     async def delete_account(self, user: User, data: DeleteAccountRequest) -> None:
-        if not verify_auth_hash(user.auth_hash, data.auth_hash):
+        if not verify_auth_hash(user.auth_hash, data.auth_hash, self.settings):
             raise PermissionError("Invalid auth_hash")
 
         # Memberships / received shares use ON DELETE SET NULL — remove rows

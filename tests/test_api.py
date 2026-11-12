@@ -8,6 +8,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy import select
 from httpx import AsyncClient
 
 from tests.conftest import register_and_login
@@ -91,6 +92,63 @@ async def test_register_login_prelogin_me(
     assert body["email"] == register_payload["email"].lower()
     assert body["encrypted_vault_key"] == register_payload["encrypted_vault_key"]
     assert body["salt"] == register_payload["salt"]
+
+
+@pytest.mark.asyncio
+async def test_auth_hash_is_not_replayable_from_database_and_legacy_rows_upgrade(
+    client: AsyncClient,
+    register_payload: dict,
+) -> None:
+    """Registration stores a keyed verifier; legacy plaintext is upgraded on login."""
+    from app.db.session import async_session_factory
+    from app.models.user import User
+
+    await register_and_login(client, register_payload)
+
+    async with async_session_factory() as db:
+        user = await db.scalar(
+            select(User).where(User.email == register_payload["email"].lower())
+        )
+        assert user is not None
+        stored_verifier = user.auth_hash
+        assert stored_verifier.startswith("hmac-sha256-v1:")
+        assert stored_verifier != register_payload["auth_hash"]
+
+    # A database dump's verifier is not accepted as the client's auth_hash.
+    replay = await client.post(
+        "/auth/login",
+        json={
+            "email": register_payload["email"],
+            "auth_hash": stored_verifier,
+        },
+    )
+    assert replay.status_code == 401
+
+    # Simulate a row from a pre-verifier deployment; successful login upgrades it.
+    async with async_session_factory() as db:
+        user = await db.scalar(
+            select(User).where(User.email == register_payload["email"].lower())
+        )
+        assert user is not None
+        user.auth_hash = register_payload["auth_hash"]
+        await db.commit()
+
+    login = await client.post(
+        "/auth/login",
+        json={
+            "email": register_payload["email"],
+            "auth_hash": register_payload["auth_hash"],
+        },
+    )
+    assert login.status_code == 200
+
+    async with async_session_factory() as db:
+        user = await db.scalar(
+            select(User).where(User.email == register_payload["email"].lower())
+        )
+        assert user is not None
+        assert user.auth_hash.startswith("hmac-sha256-v1:")
+        assert user.auth_hash != register_payload["auth_hash"]
 
 
 @pytest.mark.asyncio

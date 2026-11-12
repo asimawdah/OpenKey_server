@@ -4,7 +4,7 @@ Zero-knowledge sync API for the [OpenKey](https://github.com/OpenSelfHosting) pa
 
 Version **1.0.6** — aligned with the OpenKey app, browser extension, and CLI.
 
-The server stores **ciphertext only**. It never receives master passwords and never decrypts vault data. Authentication uses a client-derived `auth_hash` compared in constant time; vault contents, attachment blobs, org names, and share payloads stay encrypted end-to-end on the client.
+The server stores **ciphertext only**. It never receives master passwords and never decrypts vault data. Clients continue deriving `auth_hash`, but the server stores only a keyed one-way HMAC verifier, never the reusable client value. Vault contents, attachment blobs, org names, and share payloads stay encrypted end-to-end on the client.
 
 **Nearby LAN sync** between devices is peer-to-peer (UDP/TCP on the LAN). It does **not** go through this API.
 
@@ -21,8 +21,9 @@ The server stores **ciphertext only**. It never receives master passwords and ne
 
 ```bash
 cp .env.example .env
-# Required: set a strong secret (min 32 chars, not a placeholder)
+# Required: set strong, stable secrets before first startup / migration.
 openssl rand -hex 32   # paste into JWT_SECRET in .env
+openssl rand -hex 32   # paste a different value into AUTH_HASH_PEPPER in .env
 
 docker compose up --build -d
 ```
@@ -51,6 +52,7 @@ alembic upgrade head
 | `DATABASE_URL` | `postgresql+asyncpg://openkey:openkey@db:5432/openkey` | Async SQLAlchemy URL |
 | `JWT_SECRET` | *(required)* | Signing secret — **min 32 chars**; placeholders rejected at startup |
 | `JWT_ALGORITHM` | `HS256` | JWT algorithm |
+| `AUTH_HASH_PEPPER` | derived from `JWT_SECRET` when omitted | Stable server-only secret (recommended: `openssl rand -hex 32`) used to HMAC auth verifiers; back it up and do not rotate casually |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | Access JWT TTL |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Opaque refresh token TTL (rotated on use) |
 | `CORS_ORIGINS` | localhost:3000/8080 | Comma-separated origins — **no `*`** |
@@ -92,13 +94,17 @@ Register / login / refresh return:
 
 Refresh tokens are opaque (SHA-256 hashed at rest) and rotated on every `/auth/refresh`. Reuse of an already-rotated refresh token revokes **all** refresh tokens for that user (theft mitigation).
 
-`POST /auth/prelogin` returns the account salt and KDF params so a new client (e.g. browser extension) can derive `auth_hash` before calling login — no one-time paste of vault metadata required. Salt/KDF params are not secrets; the master password and plaintext vault key never leave the client.
+`POST /auth/prelogin` returns the account salt and KDF params so a new client (e.g. browser extension) can derive `auth_hash` before calling login — no one-time paste of vault metadata required. Salt/KDF params are not secrets; the master password and plaintext vault key never leave the client. The client/server request contract is unchanged: clients still submit `auth_hash` over HTTPS, while the server stores `hmac-sha256-v1:<digest>` keyed with `AUTH_HASH_PEPPER` (or a domain-separated key derived from `JWT_SECRET` when no dedicated pepper is configured).
 
 `GET /auth/me` returns opaque unlock bootstrap (`salt`, `encrypted_vault_key`, `kdf_params`) so clients can unwrap the vault key after login. The server still never sees the master password or plaintext vault key.
 
 `POST /auth/rekey` rotates the stored `auth_hash` and wrapped vault key after the client changes its master password. Entries are not re-encrypted (the vault key itself stays the same). Existing refresh tokens are revoked so other devices must log in again.
 
 `POST /auth/delete` permanently removes the account and cascaded ciphertext after the client re-proves possession of the current `auth_hash`. Local vaults on devices are unaffected.
+
+Existing accounts are upgraded by Alembic migration `006_auth_hash_verifiers`; legacy databases previously stamped directly at Alembic head are upgraded by the startup migration helper. Successful login also upgrades any remaining legacy plaintext row. The migration is intentionally irreversible because the original reusable values cannot be recovered. Configure `AUTH_HASH_PEPPER` before deploying the migration and keep the same value across backups/restores; if omitted, the verifier key is derived from `JWT_SECRET`, so rotating `JWT_SECRET` without a dedicated stable pepper will invalidate password-based login for existing accounts.
+
+This storage change protects against direct replay of a verifier obtained from a database-only leak and prevents offline verification of password guesses without the server-side pepper. It does **not** prevent replay of a captured `/auth/login` request or protect against compromise of both the database and server secret. A future OPAQUE (RFC 9807) protocol migration is the stronger long-term solution and requires coordinated client changes; this interim change deliberately preserves the existing app/extension/CLI protocol.
 
 Identity keys are opaque blobs stored for sharing/orgs; the server never decrypts them.
 
@@ -259,7 +265,7 @@ Unit tests cover settings, JWT helpers, rate limiting, folder-id sentinels, and 
 ## Security model
 
 1. Client derives `auth_hash` and vault keys from the master password (never sent).
-2. Server stores `auth_hash`, `encrypted_vault_key`, `salt`, and `kdf_params` for login/unlock bootstrap.
+2. Server stores a keyed one-way verifier of `auth_hash` plus `encrypted_vault_key`, `salt`, and `kdf_params` for login/unlock bootstrap; the reusable client-derived value is not stored.
 3. Collection names, entry payloads, attachment blobs, org names, and share payloads are opaque ciphertext.
 4. Identity `public_key` / `encrypted_private_key` and per-member `wrapped_org_key` / `wrapped_item_key` are stored as opaque blobs for client-side crypto only.
 5. Soft deletes bump `revision` so peers learn about tombstones via sync.

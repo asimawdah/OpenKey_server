@@ -11,6 +11,7 @@ from app.config import Settings
 from app.services.auth_service import (
     create_access_token,
     decode_access_token,
+    hash_auth_hash,
     verify_auth_hash,
 )
 
@@ -26,6 +27,28 @@ def test_settings() -> Settings:
 
 def test_verify_auth_hash_match() -> None:
     assert verify_auth_hash("abc", "abc") is True
+
+
+def test_auth_hash_is_stored_as_keyed_one_way_verifier(test_settings: Settings) -> None:
+    verifier = hash_auth_hash("client-derived-secret", test_settings)
+    assert verifier.startswith("hmac-sha256-v1:")
+    assert verifier != "client-derived-secret"
+    assert verify_auth_hash(verifier, "client-derived-secret", test_settings) is True
+    # A database-only attacker cannot replay the stored verifier as the credential.
+    assert verify_auth_hash(verifier, verifier, test_settings) is False
+
+
+def test_auth_hash_verifier_is_bound_to_server_pepper(test_settings: Settings) -> None:
+    verifier = hash_auth_hash("client-derived-secret", test_settings)
+    other_settings = Settings(
+        jwt_secret="another-unit-test-jwt-secret-key-32!",
+        database_url="postgresql+asyncpg://x:y@localhost/z",
+    )
+    assert verify_auth_hash(verifier, "client-derived-secret", other_settings) is False
+
+
+def test_legacy_auth_hash_remains_verifiable_for_migration() -> None:
+    assert verify_auth_hash("legacy-value==", "legacy-value") is True
 
 
 def test_verify_auth_hash_ignores_base64_padding() -> None:

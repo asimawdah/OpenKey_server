@@ -69,6 +69,27 @@ async def _apply_schema_repairs() -> None:
         await engine.dispose()
 
 
+async def _migrate_legacy_auth_hashes() -> None:
+    """Hash reusable auth_hash values in pre-Alembic databases before serving."""
+    from app.services.auth_service import hash_auth_hash
+
+    engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
+    try:
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(text("SELECT id, auth_hash FROM users"))
+            ).fetchall()
+            for user_id, stored in rows:
+                if not isinstance(stored, str) or stored.startswith("hmac-sha256-v1:"):
+                    continue
+                await conn.execute(
+                    text("UPDATE users SET auth_hash = :verifier WHERE id = :user_id"),
+                    {"verifier": hash_auth_hash(stored), "user_id": user_id},
+                )
+    finally:
+        await engine.dispose()
+
+
 async def _create_missing_tables() -> None:
     """Create any tables defined on models that are still absent (non-destructive)."""
     # Import models so metadata is fully populated.
@@ -93,6 +114,9 @@ def run_migrations() -> None:
         asyncio.run(_apply_schema_repairs())
         asyncio.run(_create_missing_tables())
         command.stamp(cfg, "head")
+        # Legacy create_all databases are stamped rather than replaying Alembic
+        # revisions; explicitly apply the auth verifier data migration here.
+        asyncio.run(_migrate_legacy_auth_hashes())
         return
 
     command.upgrade(cfg, "head")
