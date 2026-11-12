@@ -21,8 +21,9 @@ The server stores **ciphertext only**. It never receives master passwords and ne
 
 ```bash
 cp .env.example .env
-# Required: set a strong secret (min 32 chars, not a placeholder)
+# Required: set strong, stable secrets before first startup / migration.
 openssl rand -hex 32   # paste into JWT_SECRET in .env
+openssl rand -hex 32   # paste a different value into AUTH_HASH_PEPPER in .env
 
 docker compose up --build -d
 ```
